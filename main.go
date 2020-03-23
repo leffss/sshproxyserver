@@ -2,10 +2,12 @@ package main
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"net"
+	"strings"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -19,6 +21,10 @@ type Std struct {
 	Channel ssh.Channel
 }
 
+func NewStd(channel ssh.Channel) *Std {
+	return &Std{Channel: channel}
+}
+
 func (s *Std) Write(p []byte) (n int, err error)  {
 	//这里可以自定义保存终端结果，可以保存为 asciinema 格式，方便回放
 	//fmt.Printf("%s", string(p))
@@ -30,12 +36,13 @@ func (s *Std) Read(p []byte) (n int, err error) {
 }
 
 func keyAuth(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
-	log.Println(conn.RemoteAddr(), "authenticate with", key.Type())
+	log.Println(conn.RemoteAddr(), "auth with", key.Type())
 	return nil, nil
 }
 
 func passwordAuth(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error)  {
-	log.Println(conn.RemoteAddr(), "password with password")
+	_ = password
+	log.Println(conn.RemoteAddr(), "auth with password")
 	return nil, nil
 }
 
@@ -46,21 +53,61 @@ func parseDims(b []byte) (uint32, uint32) {
 	return w, h
 }
 
-func sshUpstream(host, username, password string, timeout time.Duration) (*ssh.Client, *ssh.Session, error) {
-	config := ssh.Config{
+func publicKeyAuthFunc(pemBytes, keyPassword []byte) (ssh.AuthMethod, error) {
+	// Create the Signer for this private key.
+	var (
+		signer ssh.Signer
+		err error
+	)
+	if string(keyPassword) == "" {
+		signer, err = ssh.ParsePrivateKey(pemBytes)
+	} else {
+		signer, err = ssh.ParsePrivateKeyWithPassphrase(pemBytes, keyPassword)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	return ssh.PublicKeys(signer), nil
+}
+
+func NewSshClientConfig(sshUser, sshPassword, sshType, sshKey, sshKeyPassword string, timeout time.Duration) (config *ssh.ClientConfig, err error) {
+	if sshUser == "" {
+		return nil, errors.New("ssh_user can not be empty")
+	}
+	sshConfig := ssh.Config{
 		Ciphers: []string{"aes128-ctr", "aes192-ctr", "aes256-ctr", "aes128-gcm@openssh.com", "arcfour256", "arcfour128", "aes128-cbc", "3des-cbc", "aes192-cbc", "aes256-cbc"},
 	}
+	config = &ssh.ClientConfig{
+		Config: 		 sshConfig,
+		Timeout:         timeout,
+		User:            sshUser,
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //这个可以， 但是不够安全
+		//HostKeyCallback: hostKeyCallBackFunc(h.Host),
+	}
+	switch sshType {
+	case "password":
+		config.Auth = []ssh.AuthMethod{ssh.Password(sshPassword)}
+	case "key":
+		key, err := publicKeyAuthFunc([]byte(sshKey), []byte(sshKeyPassword))
+		if err != nil {
+			return nil, err
+		}
+		config.Auth = []ssh.AuthMethod{key}
+	default:
+		return nil, fmt.Errorf("unknow ssh auth type: %s", sshType)
+	}
+	return
+}
 
-	sshConfig := &ssh.ClientConfig{
-		User: username,
-		HostKeyCallback:ssh.InsecureIgnoreHostKey(),
-		Config: config,
-		Timeout: timeout,
+func NewSshUpstream(host, username, password string, timeout time.Duration) (*ssh.Client, *ssh.Session, error) {
+	clientConfig, err := NewSshClientConfig(username, password, "password", "", "", timeout)
+	if err != nil {
+		return nil, nil, err
 	}
 
-	sshConfig.Auth = append(sshConfig.Auth, ssh.Password(password))
-
-	client, err := ssh.Dial("tcp", host, sshConfig)
+	client, err := ssh.Dial("tcp", host, clientConfig)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -97,7 +144,7 @@ func handleChannels(host, username, password string, timeout time.Duration, sshC
 			return
 		}
 
-		client, session, err := sshUpstream(host, username, password, timeout)
+		client, session, err := NewSshUpstream(host, username, password, timeout)
 		if err != nil {
 			log.Printf("could not connect ssh upstream server")
 			_, _ = channel.Write([]byte("could not connect ssh upstream server"))
@@ -119,10 +166,13 @@ func handleChannels(host, username, password string, timeout time.Duration, sshC
 		//session.Stderr = channel
 
 		// Std 调用 channel 也实现了 io.Reader 与 io.Writer 接口
-		std := &Std{Channel:channel}
+		std := NewStd(channel)
 		session.Stdin = std
 		session.Stdout = std
 		session.Stderr = std
+
+		//_, _ = io.WriteString(std, fmt.Sprintf("connect ssh upstream %s\n\r", host))
+		_, _ = std.Write([]byte(fmt.Sprintf("connect ssh upstream %s\n\r", host)))
 
 		modes := ssh.TerminalModes{
 			ssh.ECHO: 1,
@@ -138,10 +188,6 @@ func handleChannels(host, username, password string, timeout time.Duration, sshC
 			for req := range in {
 				ok := false
 				switch req.Type {
-				case "exec":
-					ok = true
-				case "shell":
-					ok = true
 				case "pty-req":
 					ok = true
 					termLen := req.Payload[3]
@@ -154,12 +200,19 @@ func handleChannels(host, username, password string, timeout time.Duration, sshC
 					w, h := parseDims(req.Payload)
 					_ = session.WindowChange(int(h), int(w))
 					continue
+				case "shell":
+					ok = true
+
+				case "exec":
+					//ok = false
 				case "subsystem":
-					log.Printf("unsupport subsystem request")
+					//ok = false
+				case "x11-req":
+					//ok = false
 				}
 
 				if !ok {
-					log.Printf("declining %s request...", req.Type)
+					log.Printf("unsupport %s request...", req.Type)
 				}
 
 				_ = req.Reply(ok, nil)
@@ -168,7 +221,7 @@ func handleChannels(host, username, password string, timeout time.Duration, sshC
 
 		// 解决 ctrl + d 退出后，连接不关闭的情况
 		go func() {
-			time.Sleep(time.Second)
+			time.Sleep(time.Second * 3)
 			if err := session.Wait(); err != nil {
 				return
 			}
@@ -199,8 +252,9 @@ func main() {
 		MaxAuthTries: 3,
 		PasswordCallback: passwordAuth,
 		PublicKeyCallback: keyAuth,
+		ServerVersion: "SSH-2.0-go-ssh-proxy-server",	// 必须以 `SSH-2.0-` 开头
 		BannerCallback: func(conn ssh.ConnMetadata) string {
-			return "Welcome to go ssh server"
+			return fmt.Sprintf("Welcome to go ssh proxy server, your address is %s", strings.Split(conn.RemoteAddr().String(), ":")[0])
 		},
 	}
 	config.AddHostKey(hostPrivateKeySigner)
@@ -225,7 +279,7 @@ func main() {
 			continue
 		}
 
-		log.Printf("new ssh connection from %s (%s)", sshConn.RemoteAddr(), sshConn.ClientVersion())
+		log.Printf("ssh connection from %s (%s)", sshConn.RemoteAddr(), sshConn.ClientVersion())
 
 		go ssh.DiscardRequests(reqs)
 
