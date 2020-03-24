@@ -2,14 +2,18 @@ package main
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net"
+	"os"
 	"strings"
 	"time"
 
+	uuid "github.com/satori/go.uuid"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -17,22 +21,154 @@ var (
 	hostPrivateKeySigner ssh.Signer
 )
 
-type Std struct {
-	Channel ssh.Channel
+// asciinema 官方目前只支持 o 和 i，目前 size 还未支持，只有 o 就足够了
+const V2Version = 2
+const V2OutputEvent = "o"
+const V2InputEvent = "i"
+const V2SizeEvent = "size"
+
+type CastV2Theme struct {
+	Fg string `json:"fg"`
+	Bg string `json:"bg"`
+	Palette string `json:"palette"`
 }
 
-func NewStd(channel ssh.Channel) *Std {
-	return &Std{Channel: channel}
+type CastV2Header struct {
+	Version uint `json:"version"`
+	Width int `json:"width"`
+	Height int `json:"height"`
+	Timestamp int64 `json:"timestamp,omitempty"`
+	Duration float32 `json:"duration,omitempty"`
+	Title string  `json:"title,omitempty"`
+	Command string  `json:"command,omitempty"`
+	Env *map[string]string `json:"env,omitempty"`
+	// this is a pointer only because that's the easiest way to force Golang's
+	// JSON marshaller to not emit it if empty
+	Theme *CastV2Theme `json:"theme,omitempty"`
+	IdleTimeLimit float32 `json:"idle_time_limit,omitempty"`
+	outputStream *json.Encoder
+}
+
+type CastMetadata struct {
+	Version   uint
+	Width     int
+	Height    int
+	Title     string
+	Timestamp time.Time
+	Duration  float32
+	Command   string
+	Env       map[string]string
+	IdleTimeLimit float32
+}
+
+func NewCastV2(meta *CastMetadata, fd io.Writer) (*CastV2Header, error) {
+	var c CastV2Header
+	c.Version = meta.Version
+	c.Width = meta.Width
+	c.Height = meta.Height
+	if meta.Title != "" {
+		c.Title = meta.Title
+	}
+
+	if meta.Timestamp.Unix() > 0 {
+		c.Timestamp = meta.Timestamp.Unix()
+	}
+
+	if meta.Duration > 0.0 {
+		c.Duration = meta.Duration
+	}
+
+	if meta.Command != "" {
+		c.Command = meta.Command
+	}
+
+	if meta.Env != nil {
+		c.Env = &meta.Env
+	}
+
+	if meta.IdleTimeLimit > 0.0 {
+		c.IdleTimeLimit = meta.IdleTimeLimit
+	}
+
+	c.outputStream = json.NewEncoder(fd)
+	return &c, nil
+}
+
+func (c *CastV2Header) PushHeader() error {
+	return c.outputStream.Encode(c)
+}
+
+func (c *CastV2Header) PushData(start time.Time, ts time.Time, event string, data []byte) error {
+	out := make([]interface{}, 3)
+	out[0] = ts.Sub(start).Seconds()
+	out[1] = event
+	out[2] = string(data)
+	// 使用这种方法能避免 \u001b 被写成 \x1b 导致 asciinema 回放错误
+	return c.outputStream.Encode(out)
+}
+
+type Std struct {
+	id string
+	channel ssh.Channel
+	shell string
+	term string
+	width int
+	height int
+	startTime time.Time
+	file *os.File
+	castV2 *CastV2Header
+}
+
+func NewStd(channel ssh.Channel, shell, term string, width, height int) *Std {
+	return &Std{
+		id: uuid.NewV4().String(),
+		channel: channel,
+		shell: shell,
+		term: term,
+		width: width,
+		height: height,
+		startTime: time.Now(),
+	}
 }
 
 func (s *Std) Write(p []byte) (n int, err error)  {
 	//这里可以自定义保存终端结果，可以保存为 asciinema 格式，方便回放
-	//fmt.Printf("%s", string(p))
-	return s.Channel.Write(p)
+	now := time.Now()
+	s.castV2.PushData(s.startTime, now, V2OutputEvent, p)
+	return s.channel.Write(p)
 }
 
 func (s *Std) Read(p []byte) (n int, err error) {
-	return s.Channel.Read(p)
+	return s.channel.Read(p)
+}
+
+func (s *Std) SetTerm(term string) {
+	s.term = term
+}
+
+func (s *Std) WriteHeader() {
+	f, _ := os.Create(s.id)
+	s.file = f
+
+	castMetadata := &CastMetadata{
+		Version:       V2Version,
+		Width:         s.width,
+		Height:        s.height,
+		//Title:         "",
+		Timestamp:     s.startTime,
+		//Duration:      0,
+		//Command:       "",
+		Env:           map[string]string{"SHELL": s.shell, "TERM": s.term},
+		//IdleTimeLimit: 0,
+	}
+
+	castV2, _ := NewCastV2(castMetadata, s.file)
+	castV2.PushHeader()
+	s.castV2 = castV2
+}
+
+func (s *Std) CloseFile() {
+	_ = s.file.Close()
 }
 
 func keyAuth(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
@@ -166,13 +302,13 @@ func handleChannels(host, username, password string, timeout time.Duration, sshC
 		//session.Stderr = channel
 
 		// Std 调用 channel 也实现了 io.Reader 与 io.Writer 接口
-		std := NewStd(channel)
+		std := NewStd(channel, "/bin/sh", "linux", 250, 40)
 		session.Stdin = std
 		session.Stdout = std
 		session.Stderr = std
 
 		//_, _ = io.WriteString(std, fmt.Sprintf("connect ssh upstream %s\n\r", host))
-		_, _ = std.Write([]byte(fmt.Sprintf("connect ssh upstream %s\n\r", host)))
+		//_, _ = std.Write([]byte(fmt.Sprintf("connect ssh upstream %s\n\r", host)))
 
 		modes := ssh.TerminalModes{
 			ssh.ECHO: 1,
@@ -191,11 +327,16 @@ func handleChannels(host, username, password string, timeout time.Duration, sshC
 				case "pty-req":
 					ok = true
 					termLen := req.Payload[3]
-					termEnv := string(req.Payload[4 : termLen+4])
+					termType := string(req.Payload[4 : termLen+4])
 					w, h := parseDims(req.Payload[termLen+4:])
 					//_ = session.WindowChange(int(h), int(w))
-					_ = session.RequestPty(termEnv, int(h), int(w), modes)
+					_ = session.RequestPty(termType, int(h), int(w), modes)
 					_ = session.Shell()
+
+					std.SetTerm(termType)
+					std.WriteHeader()
+					defer std.CloseFile()
+
 				case "window-change":
 					w, h := parseDims(req.Payload)
 					_ = session.WindowChange(int(h), int(w))
