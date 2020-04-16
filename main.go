@@ -28,6 +28,9 @@ var (
 	ZModemRzStart = fmt.Sprintf("%+q", "rz waiting to receive.**\x18B0100000023be50\r\x8a\x11")
 	ZModemRzEnd = fmt.Sprintf("%+q", "**\x18B0800000000022d\r\x8a")
 
+	// zmodem 取消 \x18\x18\x18\x18\x18\x08\x08\x08\x08\x08，使用 %+q 的形式无法正确使用 strings.Index 处理
+	ZModemCancel = string([]byte{24, 24, 24, 24, 24, 8, 8, 8, 8, 8})
+
 	hostPrivateKeySigner ssh.Signer
 	TerminalModes = ssh.TerminalModes{
 		ssh.ECHO: 1,
@@ -64,6 +67,7 @@ func NewStd(channel ssh.Channel, shell, term string, width, height int) *Std {
 
 func (s *Std) Write(p []byte) (n int, err error)  {
 	res := fmt.Sprintf("%+q", string(p))
+
 	// 使用 zModem 传输的文件内容不记录
 	if s.ZModem {
 		if res == ZModemSzEnd || res == ZModemRzEnd {
@@ -73,6 +77,10 @@ func (s *Std) Write(p []byte) (n int, err error)  {
 			if err := s.castV2.PushData(s.startTime, now, asciinema.V2OutputEvent, []byte("")); err != nil {
 				log.Println(err)
 			}
+		}
+		if index := strings.Index(string(p), ZModemCancel); index != -1 {
+			//log.Println("zModem cancel")
+			s.ZModem = false
 		}
 	} else {
 		if res == ZModemSzStart || res == ZModemRzStart {
@@ -144,12 +152,21 @@ func parseDims(b []byte) (uint32, uint32) {
 	return w, h
 }
 
-func handleChannels(host, username, password string, timeout time.Duration, sshConn *ssh.ServerConn, chans <-chan ssh.NewChannel) {
+func handleChannels(host, username, password string, timeout time.Duration, sshConn *ssh.ServerConn, chans <-chan ssh.NewChannel, sessionNum uint8) {
 	defer func() {
 		log.Printf("ssh connection close %s (%s)", sshConn.RemoteAddr(), sshConn.ClientVersion())
 	}()
 
+	notAllowCloneSession := false
+	numSession := sessionNum
+
 	for newChannel := range chans {
+
+		if notAllowCloneSession {	// 仅允许创建一个 session
+			_ = newChannel.Reject(ssh.UnknownChannelType, fmt.Sprintf("not allow clone session more"))
+			continue
+		}
+
 		if t := newChannel.ChannelType(); t != "session" {
 			_ = newChannel.Reject(ssh.UnknownChannelType, fmt.Sprintf("unknown channel type: %s", t))
 			_ = sshConn.Close()
@@ -177,6 +194,14 @@ func handleChannels(host, username, password string, timeout time.Duration, sshC
 				log.Printf("client.close err: %s", err)
 			}
 		}()
+
+		// 控制 clone session 数量
+		if sessionNum != 0 {
+			numSession--
+			if numSession == 0 {
+				notAllowCloneSession = true
+			}
+		}
 
 		// channel 实现了 io.Reader 与 io.Writer 接口
 		//session.Stdin = channel
@@ -208,7 +233,6 @@ func handleChannels(host, username, password string, timeout time.Duration, sshC
 					std.SetTerm(termType)
 					std.InitAsciinema()
 					defer std.CloseFile()
-
 				case "window-change":
 					w, h := parseDims(req.Payload)
 					_ = session.WindowChange(int(h), int(w))
@@ -278,6 +302,8 @@ func main() {
 		panic(err)
 	}
 
+	var sessionNum uint8 = 1	//控制一个 ssh 连接上能够打开的 session 数， 0 无限制，不推荐
+
 	for {
 		tcpConn, err := socket.Accept()
 		if err != nil {
@@ -297,6 +323,6 @@ func main() {
 		go ssh.DiscardRequests(reqs)
 
 		// Accept all channels
-		go handleChannels(host, username, password, timeout, sshConn, chans)
+		go handleChannels(host, username, password, timeout, sshConn, chans, sessionNum)
 	}
 }
