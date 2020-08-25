@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net"
@@ -18,38 +20,70 @@ import (
 )
 
 var (
-	// sz 下载文件
-	ZModemSzStart = fmt.Sprintf("%+q", "rz\r**\x18B00000000000000\r\x8a\x11")
-	ZModemSzEnd = fmt.Sprintf("%+q", "\r**\x18B0800000000022d\r\x8a")
-	// 经过测试发现不一定会出现，就是两个大写的字母 o, 建议不过滤
-	//ZModemSzEnd2 = fmt.Sprintf("%+q", "OO")
+	// sz fmt.Sprintf("%+q", "rz\r**\x18B00000000000000\r\x8a\x11")
+	//ZModemSZStart = []byte{13, 42, 42, 24, 66, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 13, 138, 17}
+	ZModemSZStart = []byte{42, 42, 24, 66, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 13, 138, 17}
+	// sz 结束 fmt.Sprintf("%+q", "\r**\x18B0800000000022d\r\x8a")
+	//ZModemSZEnd = []byte{13, 42, 42, 24, 66, 48, 56, 48, 48, 48, 48, 48, 48, 48, 48, 48, 50, 50, 100, 13, 138}
+	ZModemSZEnd = []byte{42, 42, 24, 66, 48, 56, 48, 48, 48, 48, 48, 48, 48, 48, 48, 50, 50, 100, 13, 138}
+	// sz 结束后可能还会发送两个 OO，但是经过测试发现不一定每次都会发送 fmt.Sprintf("%+q", "OO")
+	ZModemSZEndOO = []byte{79, 79}
 
-	// rz 上传文件
-	ZModemRzStart = fmt.Sprintf("%+q", "rz waiting to receive.**\x18B0100000023be50\r\x8a\x11")
-	ZModemRzEnd = fmt.Sprintf("%+q", "**\x18B0800000000022d\r\x8a")
+	// rz fmt.Sprintf("%+q", "**\x18B0100000023be50\r\x8a\x11")
+	ZModemRZStart = []byte{42, 42, 24, 66, 48, 49, 48, 48, 48, 48, 48, 48, 50, 51, 98, 101, 53, 48, 13, 138, 17}
+	// rz -e fmt.Sprintf("%+q", "**\x18B0100000063f694\r\x8a\x11")
+	ZModemRZEStart = []byte{42, 42, 24, 66, 48, 49, 48, 48, 48, 48, 48, 48, 54, 51, 102, 54, 57, 52, 13, 138, 17}
+	// rz -S fmt.Sprintf("%+q", "**\x18B0100000223d832\r\x8a\x11")
+	ZModemRZSStart = []byte{42, 42, 24, 66, 48, 49, 48, 48, 48, 48, 48, 50, 50, 51, 100, 56, 51, 50, 13, 138, 17}
+	// rz -e -S fmt.Sprintf("%+q", "**\x18B010000026390f6\r\x8a\x11")
+	ZModemRZESStart = []byte{42, 42, 24, 66, 48, 49, 48, 48, 48, 48, 48, 50, 54, 51, 57, 48, 102, 54, 13, 138, 17}
+	// rz 结束 fmt.Sprintf("%+q", "**\x18B0800000000022d\r\x8a")
+	ZModemRZEnd = []byte{42, 42, 24, 66, 48, 56, 48, 48, 48, 48, 48, 48, 48, 48, 48, 50, 50, 100, 13, 138}
 
-	// zmodem 取消 \x18\x18\x18\x18\x18\x08\x08\x08\x08\x08，使用 %+q 的形式无法正确使用 strings.Index 处理
-	ZModemCancel = string([]byte{24, 24, 24, 24, 24, 8, 8, 8, 8, 8})
+	// **\x18B0
+	ZModemRZCtrlStart = []byte{42, 42, 24, 66, 48}
+	// \r\x8a\x11
+	ZModemRZCtrlEnd1 = []byte{13, 138, 17}
+	// \r\x8a
+	ZModemRZCtrlEnd2 = []byte{13, 138}
+
+	// zmodem 取消 \x18\x18\x18\x18\x18\x08\x08\x08\x08\x08
+	ZModemCancel = []byte{24, 24, 24, 24, 24, 8, 8, 8, 8, 8}
 
 	hostPrivateKeySigner ssh.Signer
-	TerminalModes = ssh.TerminalModes{
+	terminalModes = ssh.TerminalModes{
 		ssh.ECHO: 1,
-		ssh.TTY_OP_ISPEED: 14400,
-		ssh.TTY_OP_OSPEED: 14400,
+		ssh.TTY_OP_ISPEED: 8192,
+		ssh.TTY_OP_OSPEED: 8192,
+		ssh.IEXTEN: 0,
 	}
 )
 
+func ByteContains(x, y []byte) (n []byte, contain bool)  {
+	index := bytes.Index(x, y)
+	if index == -1 {
+		return
+	}
+	lastIndex := index + len(y)
+	n = append(x[:index], x[lastIndex:]...)
+	return n, true
+}
+
 type Std struct {
 	channel ssh.Channel
+	SshStdin io.WriteCloser
+	SshStdout, SshStderr io.Reader
 	id string
 	shell string
 	term string
 	width int
 	height int
 	startTime time.Time
-	ZModem bool
 	file *os.File
 	castV2 *asciinema.CastV2Header
+	DisableZModemSZ, DisableZModemRZ bool
+	ZModemSZ, ZModemRZ, ZModemSZOO bool
+	buffSize int
 }
 
 func NewStd(channel ssh.Channel, shell, term string, width, height int) *Std {
@@ -61,44 +95,247 @@ func NewStd(channel ssh.Channel, shell, term string, width, height int) *Std {
 		width: width,
 		height: height,
 		startTime: time.Now(),
-		ZModem: false,
+		buffSize: 1024,
 	}
 }
 
-func (s *Std) Write(p []byte) (n int, err error)  {
-	res := fmt.Sprintf("%+q", string(p))
+func (s *Std) DisableSZ() {
+	s.DisableZModemSZ = true
+}
 
-	// 使用 zModem 传输的文件内容不记录
-	if s.ZModem {
-		if res == ZModemSzEnd || res == ZModemRzEnd {
-			//log.Println("zModem end")
-			s.ZModem = false
-			now := time.Now()
-			if err := s.castV2.PushData(s.startTime, now, asciinema.V2OutputEvent, []byte("")); err != nil {
-				log.Println(err)
+func (s *Std) EnableSZ() {
+	s.DisableZModemSZ = false
+}
+
+func (s *Std) DisableRZ() {
+	s.DisableZModemRZ = true
+}
+
+func (s *Std) EnableRZ() {
+	s.DisableZModemRZ = false
+}
+
+func (s *Std) ReadChannel() {
+	readChannel := func() {
+		buff := make([]byte, 8192)
+		for {
+			n, err := s.channel.Read(buff)
+			if err != nil {
+				return
 			}
-		}
-		if index := strings.Index(string(p), ZModemCancel); index != -1 {
-			//log.Println("zModem cancel")
-			s.ZModem = false
-		}
-	} else {
-		if res == ZModemSzStart || res == ZModemRzStart {
-			//log.Println("zModem start")
-			s.ZModem = true
-		} else {
-			// 保存结果为 asciinema v2 格式，方便回放
-			now := time.Now()
-			if err := s.castV2.PushData(s.startTime, now, asciinema.V2OutputEvent, p); err != nil {
-				log.Println(err)
+			_, err = s.SshStdin.Write(buff[:n])
+			if err != nil {
+				return
 			}
 		}
 	}
-	return s.channel.Write(p)
+	go readChannel()
 }
 
-func (s *Std) Read(p []byte) (n int, err error) {
-	return s.channel.Read(p)
+func (s *Std) ReadSsh() {
+	readSsh := func(r io.Reader, w io.WriteCloser) {
+		buff := make([]byte, 8192)
+		for {
+			n, err := r.Read(buff)
+			if err != nil {
+				return
+			}
+			// 使用 zModem 传输的文件内容不记录
+			if s.ZModemSZOO {
+				s.channel.Write(buff[:n])
+				s.ZModemSZOO = false
+				if n < 2 {
+					now := time.Now()
+					if err := s.castV2.PushData(s.startTime, now, asciinema.V2OutputEvent, buff[:n]); err != nil {
+						log.Println(err)
+					}
+				} else if n == 2 {
+					if buff[0] != ZModemSZEndOO[0] || buff[1] != ZModemSZEndOO[1] {
+						now := time.Now()
+						if err := s.castV2.PushData(s.startTime, now, asciinema.V2OutputEvent, buff[:n]); err != nil {
+							log.Println(err)
+						}
+					}
+				} else {
+					if buff[0] == ZModemSZEndOO[0] && buff[1] == ZModemSZEndOO[1] {
+						now := time.Now()
+						if err := s.castV2.PushData(s.startTime, now, asciinema.V2OutputEvent, buff[2:n]); err != nil {
+							log.Println(err)
+						}
+					} else {
+						now := time.Now()
+						if err := s.castV2.PushData(s.startTime, now, asciinema.V2OutputEvent, buff[:n]); err != nil {
+							log.Println(err)
+						}
+					}
+				}
+			} else {
+				if s.ZModemSZ {
+					s.channel.Write(buff[:n])
+					if n < s.buffSize {
+						if x, ok := ByteContains(buff[:n], ZModemSZEnd); ok {
+							s.ZModemSZ = false
+							s.ZModemSZOO = true
+							if len(x) != 0 {
+								now := time.Now()
+								if err := s.castV2.PushData(s.startTime, now, asciinema.V2OutputEvent, x); err != nil {
+									log.Println(err)
+								}
+							}
+						} else if _, ok := ByteContains(buff[:n], ZModemCancel); ok {
+							s.ZModemSZ = false
+						}
+					} else {
+						if _, ok := ByteContains(buff[:n], ZModemCancel); ok {
+							s.ZModemSZ = false
+						}
+					}
+				} else if s.ZModemRZ {
+					s.channel.Write(buff[:n])
+					if x, ok := ByteContains(buff[:n], ZModemRZEnd); ok {
+						s.ZModemRZ = false
+						if len(x) != 0 {
+							now := time.Now()
+							if err := s.castV2.PushData(s.startTime, now, asciinema.V2OutputEvent, x); err != nil {
+								log.Println(err)
+							}
+						}
+					} else if _, ok := ByteContains(buff[:n], ZModemCancel); ok {
+						s.ZModemRZ = false
+					} else {
+						// rz 上传过程中服务器端还是会给客户端发送一些信息，比如心跳
+						startIndex := bytes.Index(buff[:n], ZModemRZCtrlStart)
+						if startIndex != -1 {
+							endIndex := bytes.Index(buff[:n], ZModemRZCtrlEnd1)
+							if endIndex != -1 {
+								ctrl := append(ZModemRZCtrlStart, buff[startIndex + len(ZModemRZCtrlStart):endIndex]...)
+								ctrl = append(ctrl, ZModemRZCtrlEnd1...)
+								info := append(buff[:startIndex], buff[endIndex + len(ZModemRZCtrlEnd1):n]...)
+								if len(info) != 0 {
+									now := time.Now()
+									if err := s.castV2.PushData(s.startTime, now, asciinema.V2OutputEvent, info); err != nil {
+										log.Println(err)
+									}
+								}
+							} else {
+								endIndex = bytes.Index(buff[:n], ZModemRZCtrlEnd2)
+								if endIndex != -1 {
+									ctrl := append(ZModemRZCtrlStart, buff[startIndex + len(ZModemRZCtrlStart):endIndex]...)
+									ctrl = append(ctrl, ZModemRZCtrlEnd2...)
+									info := append(buff[:startIndex], buff[endIndex + len(ZModemRZCtrlEnd2):n]...)
+									if len(info) != 0 {
+										now := time.Now()
+										if err := s.castV2.PushData(s.startTime, now, asciinema.V2OutputEvent, info); err != nil {
+											log.Println(err)
+										}
+									}
+								} else {
+									now := time.Now()
+									if err := s.castV2.PushData(s.startTime, now, asciinema.V2OutputEvent, buff[:n]); err != nil {
+										log.Println(err)
+									}
+								}
+							}
+						} else {
+							now := time.Now()
+							if err := s.castV2.PushData(s.startTime, now, asciinema.V2OutputEvent, buff[:n]); err != nil {
+								log.Println(err)
+							}
+						}
+					}
+				} else {
+					if x, ok := ByteContains(buff[:n], ZModemSZStart); ok {
+						if s.DisableZModemSZ {
+							s.channel.Write([]byte("sz is disabled\r\n"))
+							w.Write(ZModemCancel)
+							//w.Write([]byte("\n"))
+						} else {
+							s.channel.Write(buff[:n])
+							if y, ok := ByteContains(x, ZModemCancel); ok {
+								// 下载不存在的文件以及文件夹(zmodem 不支持下载文件夹)时
+								now := time.Now()
+								if err := s.castV2.PushData(s.startTime, now, asciinema.V2OutputEvent, y); err != nil {
+									log.Println(err)
+								}
+							} else {
+								s.ZModemSZ = true
+								if len(x) != 0 {
+									now := time.Now()
+									if err := s.castV2.PushData(s.startTime, now, asciinema.V2OutputEvent, x); err != nil {
+										log.Println(err)
+									}
+								}
+							}
+						}
+					} else if x, ok := ByteContains(buff[:n], ZModemRZStart); ok {
+						if s.DisableZModemRZ {
+							s.channel.Write([]byte("rz is disabled\r\n"))
+							w.Write(ZModemCancel)
+						} else {
+							s.channel.Write(buff[:n])
+							s.ZModemRZ = true
+							if len(x) != 0 {
+								now := time.Now()
+								if err := s.castV2.PushData(s.startTime, now, asciinema.V2OutputEvent, x); err != nil {
+									log.Println(err)
+								}
+							}
+						}
+					} else if x, ok := ByteContains(buff[:n], ZModemRZEStart); ok {
+						if s.DisableZModemRZ {
+							s.channel.Write([]byte("rz is disabled\r\n"))
+							w.Write(ZModemCancel)
+						} else {
+							s.channel.Write(buff[:n])
+							s.ZModemRZ = true
+							if len(x) != 0 {
+								now := time.Now()
+								if err := s.castV2.PushData(s.startTime, now, asciinema.V2OutputEvent, x); err != nil {
+									log.Println(err)
+								}
+							}
+						}
+					} else if x, ok := ByteContains(buff[:n], ZModemRZSStart); ok {
+						if s.DisableZModemRZ {
+							s.channel.Write([]byte("rz is disabled\r\n"))
+							w.Write(ZModemCancel)
+						} else {
+							s.channel.Write(buff[:n])
+							s.ZModemRZ = true
+							if len(x) != 0 {
+								now := time.Now()
+								if err := s.castV2.PushData(s.startTime, now, asciinema.V2OutputEvent, x); err != nil {
+									log.Println(err)
+								}
+							}
+						}
+					} else if x, ok := ByteContains(buff[:n], ZModemRZESStart); ok {
+						if s.DisableZModemRZ {
+							s.channel.Write([]byte("rz is disabled\r\n"))
+							w.Write(ZModemCancel)
+						} else {
+							s.channel.Write(buff[:n])
+							s.ZModemRZ = true
+							if len(x) != 0 {
+								now := time.Now()
+								if err := s.castV2.PushData(s.startTime, now, asciinema.V2OutputEvent, x); err != nil {
+									log.Println(err)
+								}
+							}
+						}
+					} else {
+						s.channel.Write(buff[:n])
+						now := time.Now()
+						if err := s.castV2.PushData(s.startTime, now, asciinema.V2OutputEvent, buff[:n]); err != nil {
+							log.Println(err)
+						}
+					}
+				}
+			}
+		}
+	}
+	go readSsh(s.SshStdout, s.SshStdin)
+	go readSsh(s.SshStderr, s.SshStdin)
 }
 
 func (s *Std) SetTerm(term string) {
@@ -161,7 +398,6 @@ func handleChannels(host, username, password string, timeout time.Duration, sshC
 	numSession := sessionNum
 
 	for newChannel := range chans {
-
 		if notAllowCloneSession {	// 仅允许创建一个 session
 			_ = newChannel.Reject(ssh.UnknownChannelType, fmt.Sprintf("not allow clone session more"))
 			continue
@@ -210,9 +446,9 @@ func handleChannels(host, username, password string, timeout time.Duration, sshC
 
 		// Std 通过继承 channel 也实现了 io.Reader 与 io.Writer 接口
 		std := NewStd(channel, "/bin/sh", "linux", 250, 40)
-		session.Stdin = std
-		session.Stdout = std
-		session.Stderr = std
+		//session.Stdin = std
+		//session.Stdout = std
+		//session.Stderr = std
 
 		//_, _ = io.WriteString(std, fmt.Sprintf("connect ssh upstream %s\n\r", host))
 
@@ -227,19 +463,29 @@ func handleChannels(host, username, password string, timeout time.Duration, sshC
 					termType := string(req.Payload[4 : termLen+4])
 					w, h := parseDims(req.Payload[termLen+4:])
 					//_ = session.WindowChange(int(h), int(w))
-					_ = session.RequestPty(termType, int(h), int(w), TerminalModes)
+					_ = session.RequestPty(termType, int(h), int(w), terminalModes)
+					stdin, _ := session.StdinPipe()
+					stdout, _ := session.StdoutPipe()
+					stderr, _ := session.StderrPipe()
+					std.SshStdin = stdin
+					std.SshStdout = stdout
+					std.SshStderr = stderr
+					//std.DisableSZ()
+					//std.DisableRZ()
+					std.ReadChannel()
+					std.ReadSsh()
 					_ = session.Shell()
-
 					std.SetTerm(termType)
 					std.InitAsciinema()
 					defer std.CloseFile()
+					defer session.Close()
+					defer stdin.Close()
 				case "window-change":
 					w, h := parseDims(req.Payload)
 					_ = session.WindowChange(int(h), int(w))
 					continue
 				case "shell":
 					ok = true
-
 				case "exec":
 					//ok = false
 				case "subsystem":
@@ -247,11 +493,9 @@ func handleChannels(host, username, password string, timeout time.Duration, sshC
 				case "x11-req":
 					//ok = false
 				}
-
 				if !ok {
 					log.Printf("unsupport %s request...", req.Type)
 				}
-
 				_ = req.Reply(ok, nil)
 			}
 		}(requests)
@@ -280,7 +524,7 @@ func init() {
 }
 
 func main() {
-	host := "192.168.223.111:22"
+	host := "192.168.223.101:22"
 	username := "root"
 	password := "123456"
 	timeout := 5 * time.Second
@@ -301,6 +545,8 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+
+	fmt.Println("start ssh proxy server on port:", port)
 
 	var sessionNum uint8 = 1	//控制一个 ssh 连接上能够打开的 session 数， 0 无限制，不推荐
 
